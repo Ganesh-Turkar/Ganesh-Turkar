@@ -1,0 +1,586 @@
+---
+- hosts: localhost
+  gather_facts: false
+  connection: local
+  tasks:
+    - add_host:
+        name: "am01wnddxc0001"
+        groups: remote_machine
+        ansible_user: "{{username}}"
+        ansible_password: "{{password}}"
+        ansible_connection: winrm
+        ansible_winrm_transport: kerberos
+        ansible_winrm_server_cert_validation: ignore
+        ansible_winrm_port: 5985
+
+- hosts: remote_machine
+  gather_facts: false
+  tasks:
+    - name: Part 1 - Fetch failed backups from Azure
+      win_shell: |
+        $todaysDate = Get-Date -Format "dd-MM-yyyy"
+        $clientId = "{{azure_client_id}}"
+        $clientSecret = "{{azure_client_secret}}"
+        $tenantId = "{{azure_tenant_id}}"
+        $workspaceId = "{{azure_workspace_id}}"
+        $tokenEndpoint = "https://login.microsoftonline.com/$tenantId/oauth2/token"
+        $body = @{
+            'grant_type'    = 'client_credentials'
+            'client_id'     = $clientId
+            'client_secret' = $clientSecret
+            'resource'      = 'https://api.loganalytics.io/'
+        }
+        $tokenResponse = Invoke-RestMethod -Uri $tokenEndpoint -Method POST -Body $body
+        $headers = @{
+            'Authorization' = 'Bearer ' + $tokenResponse.access_token
+            'Content-Type'  = 'application/json'
+        }
+        $query = @"
+        AddonAzureBackupJobs
+        | where JobOperation == 'Backup'
+        | where TimeGenerated >= startofday(datetime_add('day', -1, now())) and TimeGenerated < startofday(now())
+        | where BackupManagementType contains 'VM'
+        | where JobStatus == 'Failed'
+        | project BackupItemUniqueId, JobStatus, JobFailureCode
+        "@
+        $encodedQuery = [System.Web.HttpUtility]::UrlEncode($query)
+        $apiUrl = "https://api.loganalytics.io/v1/workspaces/$workspaceId/query?query=$encodedQuery"
+        $response = Invoke-RestMethod -Method Get -Uri $apiUrl -Headers $headers
+        $columns = $response.tables[0].columns
+        $rows = $response.tables[0].rows
+        $azureresults = @()
+        foreach ($row in $rows) {
+            $obj = New-Object PSObject
+            for ($i = 0; $i -lt $columns.Count; $i++) {
+                $value = $row[$i]
+                if ($columns[$i].name -eq "BackupItemUniqueId") {
+                    $value = ($value -split ";")[-1].ToUpper()
+                }
+                $obj | Add-Member -MemberType NoteProperty -Name $columns[$i].name -Value $value
+            }
+            $azureresults += $obj
+        }
+        $azureresults | ConvertTo-Json -Compress > C:\temp\azureresults.json
+      register: part1_results
+      ignore_errors: true
+
+    - name: Part 2 - Fetch Cluster Health, Backup Report and Vcenter 
+      win_shell: |
+        Import-Module RubrikSecurityCloud
+        $azureresults = Get-Content C:\temp\azureresults.json | ConvertFrom-Json
+        #For China in server
+        add-type @"
+        using System.Net;
+        using System.Security.Cryptography.X509Certificates;
+        public class TrustAllCertsPolicy : ICertificatePolicy {
+            public bool CheckValidationResult(
+                ServicePoint srvPoint, X509Certificate certificate,
+                WebRequest request, int certificateProblem) {
+                return true;
+            }
+        }
+        "@
+        [System.Net.ServicePointManager]::CertificatePolicy = New-Object TrustAllCertsPolicy
+        $FinalClusterReports = @()
+        $Finalqop_results = @()
+        $failedEvents = @()
+        $FinalvcenterObjects = @()
+        $list = @("RSC", "China")
+        foreach ($item in $list) {
+            if ($item -eq "RSC") {
+                Write-Output "Connecting to RSC..."
+                $creds = @{
+                    client_id =  "{{rsc_client_id}}"
+                    client_secret =  "{{rsc_client_secret}}" | ConvertTo-SecureString -AsPlainText -Force
+                    access_token_uri =  "{{rsc_access_token_uri}}"
+                }
+            } else {
+                Write-Output "Connecting to China..."
+                $creds = @{
+                    client_id =  "{{china_client_id}}"
+                    client_secret =  "{{china_client_secret}}"   | ConvertTo-SecureString -AsPlainText -Force
+                    access_token_uri = "{{china_access_token_uri}}"
+                }
+            }
+            try {
+                Connect-RSC -ClientId $creds["client_id"] -ClientSecret $creds["client_secret"] -Server $creds["access_token_uri"]
+            } catch {
+                $_.Exception | Format-List -Force
+            }
+            # Fetch Cluster Reports
+            $query = @"
+            query {
+                clusterConnection {
+                    nodes {
+                        id
+                        name
+                        status
+                        metric {
+                            availableCapacity
+                            usedCapacity
+                            totalCapacity
+                        }
+                        clusterNodeConnection {
+                            nodes {
+                                hostname
+                                id
+                                clusterId
+                                ram
+                                cpuCores
+                                status
+                                hardwareHealth {
+                                    isHealthy
+                                    message
+                                }
+                            }
+                            count
+                        }
+                    }
+                }
+            }
+        "@
+            $response = Invoke-Rsc -GqlQuery $query
+            $ClusterReports = @()
+            foreach ($cluster in $response.nodes) {
+                $healthyNodes = 0
+                foreach ($node in $cluster.clusterNodeConnection.nodes) {
+                    if ($node.status -eq "OK") {
+                        $healthyNodes += 1
+                    }
+                }
+                $TotalNodes = $cluster.clusterNodeConnection.count
+                $totalStorageTB = [math]::Round($cluster.metric.totalCapacity / 1TB, 2)
+                $usedStorageTB = [math]::Round($cluster.metric.usedCapacity / 1TB, 2)
+                $freeStorageTB = [math]::Round($cluster.metric.availableCapacity / 1TB, 2)
+                $availableStoragePercent = [math]::Round(($freeStorageTB / $totalStorageTB) * 100, 2)
+                $ClusterReport = [PSCustomObject]@{
+                    ClusterName               = $cluster.Name
+                    HealthStatus              = $cluster.Status
+                    TotalStorageTB            = $totalStorageTB
+                    UsedStorageTB             = $usedStorageTB
+                    FreeStorageTB             = $freeStorageTB
+                    AvailableStorage          = $availableStoragePercent
+                    TotalNodes                = $TotalNodes
+                    HealthyNodes              = $healthyNodes
+                }
+                $ClusterReports += $ClusterReport
+            }
+            $FinalClusterReports += $ClusterReports
+            # Fetch Backup events
+            $gqlQuery = '
+              query QueryActivitySeriesConnection(
+                $first: Int,
+                $after: String,
+                $last: Int,
+                $before: String,
+                $sortOrder: SortOrder,
+                $sortBy: ActivitySeriesSortField,
+                $filters: ActivitySeriesFilter
+              ) {
+                activitySeriesConnection(
+                  first: $first,
+                  after: $after,
+                  last: $last,
+                  before: $before,
+                  sortOrder: $sortOrder,
+                  sortBy: $sortBy,
+                  filters: $filters
+                ) {
+                  nodes {
+                    lastActivityStatus
+                    lastActivityType
+                    objectType
+                    severity
+                    activitySeriesId
+                    causeErrorCode
+                    causeErrorMessage
+                    causeErrorReason
+                    causeErrorRemedy
+                    clusterName
+                    clusterUuid
+                    failureReason
+                    fid
+                    id
+                    lastUpdated
+                    lastVerifiedAt
+                    objectId
+                    objectName
+                    progress
+                    startTime
+                  }
+                  pageInfo {
+                    endCursor
+                    hasNextPage
+                  }
+                }
+              }
+        '
+            $currentDateTime = Get-Date
+            $timeBack24hrs = $currentDateTime.AddDays(-1)
+            $lastUpdatedTimeGt_24hrs = $timeBack24hrs.ToString("yyyy-MM-ddTHH:mm:ssZ")
+            $filters = @{
+                lastUpdatedTimeGt = $lastUpdatedTimeGt_24hrs
+                lastActivityType = @("BACKUP", "FILESET", "VCENTER", "VOLUME_GROUP")
+            }
+            $after = $null
+            $qop = @()
+            do {
+                $variables = @{
+                    filters = $filters
+                    sortBy = "START_TIME"
+                    sortOrder = "ASC"
+                    after = $after
+                }
+                $response = Invoke-Rsc -GqlQuery $gqlQuery -Var $variables
+                $data = $response
+                $qop += $data.Nodes
+                $after = $data.pageInfo.endCursor
+            } while ($data.pageInfo.hasNextPage)
+            $results = @{}
+            foreach ($event in $qop) {
+                $clusterName = $event.clusterName
+                if ($null -ne $clusterName) {
+                    if (-not $results.ContainsKey($clusterName)) {
+                        $results[$clusterName] = [PSCustomObject]@{
+                            ClusterName = $clusterName
+                            SuccessBackups = 0
+                            FailedBackups = 0
+                            TotalBackups = 0
+                            BackupSuccessPercentage = 0
+                        }
+                    }
+                    if ($event.lastActivityStatus -eq "SUCCESS" -or $event.lastActivityStatus -eq "TASK_SUCCESS" -or $event.lastActivityStatus -eq "PARTIAL_SUCCESS") {
+                        $results[$clusterName].SuccessBackups++
+                    } elseif ($event.lastActivityStatus -eq "FAILURE" -or $event.lastActivityStatus -eq "TASK_FAILURE") {
+                        $results[$clusterName].FailedBackups++
+                        $failedEvents += $event
+                    }
+                }
+            }
+            foreach ($result in $results.Values) {
+                $result.TotalBackups = $result.SuccessBackups + $result.FailedBackups
+                if ($result.TotalBackups -ne 0) {
+                    $result.BackupSuccessPercentage = [math]::Round(($result.SuccessBackups / $result.TotalBackups) * 100, 2)
+                } else {
+                    $result.BackupSuccessPercentage = 0
+                }
+            }
+            $qop_results = $results.Values
+            $Finalqop_results += $qop_results
+            $vcenterQuery = @"
+            query {
+                vSphereVCenterConnection {
+                    nodes {
+                        name
+                        connectionStatus {
+                            message
+                            status
+                        }
+                        cluster {
+                            name
+                        }
+                    }
+                    count
+                }
+            }
+        "@
+            $vcenterResponse = Invoke-Rsc -GqlQuery $vcenterQuery
+            $textInfo = [System.Globalization.CultureInfo]::CurrentCulture.TextInfo
+            $vcenterObjects = $vcenterResponse.nodes | ForEach-Object {
+                $statusParts = $_.connectionStatus.status -split '_'
+                $status = $textInfo.ToTitleCase($statusParts[-1].ToLower())
+                [PSCustomObject]@{
+                    "Cluster Name" = $_.cluster.name
+                    "V-center Name" = $_.name
+                    "Status" = $status
+                }
+            }
+            $FinalvcenterObjects += $vcenterObjects
+
+            Disconnect-Rsc
+        }
+        $FinalClusterReports | ConvertTo-Json -Compress > C:\temp\FinalClusterReports.json
+        $Finalqop_results | ConvertTo-Json -Compress > C:\temp\Finalqop_results.json
+        $failedEvents | ConvertTo-Json -Compress > C:\temp\failedEvents.json
+        $FinalvcenterObjects | ConvertTo-Json -Compress > C:\temp\FinalvcenterObjects.json
+        $azureresults | ConvertTo-Json -Compress > C:\temp\azureresults.json
+      register: part2_results
+      ignore_errors: true
+
+    - name: Part 3 - Fetch SAPHANA and Data Guard Groups Oracle
+      win_shell: |
+        Import-Module RubrikSecurityCloud
+        $FinalClusterReports = Get-Content C:\temp\FinalClusterReports.json | ConvertFrom-Json
+        $Finalqop_results = Get-Content C:\temp\Finalqop_results.json | ConvertFrom-Json
+        $failedEvents = Get-Content C:\temp\failedEvents.json | ConvertFrom-Json
+        $azureresults = Get-Content C:\temp\azureresults.json | ConvertFrom-Json
+        Write-Output "Connecting to RSC..."
+        $creds = @{
+            client_id =  "{{rsc_client_id}}"
+            client_secret =  "{{rsc_client_secret}}" | ConvertTo-SecureString -AsPlainText -Force
+            access_token_uri =  "{{rsc_access_token_uri}}"
+        }
+        try {
+                Connect-RSC -ClientId $creds["client_id"] -ClientSecret $creds["client_secret"] -Server $creds["access_token_uri"]
+            } catch {
+                $_.Exception | Format-List -Force
+            }
+        # DATA GUARD GROUPS Oracle
+        $oracle_query = @"
+        query {
+          oracleDatabases {
+            nodes {
+              name
+              id
+              dbUniqueName
+              dataGuardType
+              dataGuardGroup {
+                id
+                name
+                dataGuardType
+                cluster {
+                  name
+                }
+              }
+            }
+            count
+          }
+        }
+        "@
+        $oracle_response = Invoke-Rsc -GqlQuery $oracle_query
+        $oracle_response | Format-Table -AutoSize
+        $filteredNodes = $oracle_response.nodes | Where-Object {
+            $_.dataGuardType -eq "DATA_GUARD_MEMBER" -and $_.dataGuardGroup.cluster.name -eq "am01prdrbk01"
+        }
+        $groupedNodes = $filteredNodes | Group-Object -Property { $_.dataGuardGroup.name }
+        $dataGuardGroups = $groupedNodes | ForEach-Object {
+            [PSCustomObject]@{
+                DataGroup = $_.Name
+                Count = $_.Count
+            }
+        }
+        $dataGuardGroups | ConvertTo-Json -Compress > C:\temp\dataGuardGroups.json
+        # SAPHANA
+        $saphana_query = @"
+        query {
+          sapHanaSystems {
+            nodes {
+              name
+              status
+              clusterUuid
+              statusMessage
+              sid
+            }
+          }
+        }
+        "@
+        $saphana = Invoke-Rsc -GqlQuery $saphana_query
+        $saphana = $saphana.nodes
+        $groupedResults = $saphana | Group-Object -Property sid
+        $summary = @{}
+        foreach ($group in $groupedResults) {
+            $sid = $group.Name
+            $statuses = $group.Group | Group-Object -Property Status
+            $okCount = 0
+            $warningCount = 0
+            $errorCount = 0
+            foreach ($status in $statuses) {
+                switch ($status.Name) {
+                    "OK" { $okCount = $status.Count }
+                    "WARNING" { $warningCount = $status.Count }
+                    "ERROR" { $errorCount = $status.Count }
+                }
+            }
+            if ($okCount -eq $group.Count) {
+                $summary[$sid] = "Connected"
+            } else {
+                $statusSummary = @()
+                if ($warningCount -gt 0) { $statusSummary += "$warningCount Warnings" }
+                if ($errorCount -gt 0) { $statusSummary += "$errorCount Errors" }
+                $summary[$sid] = [string]::Join(" ", $statusSummary)
+            }
+        }
+        $summary | ConvertTo-Json -Compress > C:\temp\saphanaSummary.json
+        Disconnect-Rsc
+      register: part3_results
+      ignore_errors: true
+
+    - name: Part 4 - HTML Report and Send Mail
+      win_shell: |
+        $FinalClusterReports = Get-Content C:\temp\FinalClusterReports.json | ConvertFrom-Json
+        $Finalqop_results = Get-Content C:\temp\Finalqop_results.json | ConvertFrom-Json
+        $failedEvents = Get-Content C:\temp\failedEvents.json | ConvertFrom-Json
+        $FinalvcenterObjects = Get-Content C:\temp\FinalvcenterObjects.json | ConvertFrom-Json
+        $azureresults = Get-Content C:\temp\azureresults.json | ConvertFrom-Json
+        $dataGuardGroups = Get-Content C:\temp\dataGuardGroups.json | ConvertFrom-Json
+        $saphanaSummary = Get-Content C:\temp\saphanaSummary.json | ConvertFrom-Json
+        $todaysDate = Get-Date -Format "dd-MM-yyyy"
+        # Exporting failed events to Excel
+        $failedEventsTable = $failedEvents | ForEach-Object {
+              [PSCustomObject]@{
+                  lastActivityStatus = $_.lastActivityStatus
+                  lastActivityType = $_.lastActivityType
+                  objectType = $_.objectType
+                  severity = $_.severity
+                  activitySeriesId = $_.activitySeriesId
+                  causeErrorCode = $_.causeErrorCode
+                  causeErrorMessage = $_.causeErrorMessage
+                  causeErrorReason = $_.causeErrorReason
+                  causeErrorRemedy = $_.causeErrorRemedy
+                  clusterName = $_.clusterName
+                  clusterUuid = $_.clusterUuid
+                  failureReason = $_.failureReason
+                  fid = $_.fid
+                  id = $_.id
+                  lastUpdated = $_.lastUpdated
+                  lastVerifiedAt = $_.lastVerifiedAt
+                  objectId = $_.objectId
+                  objectName = $_.objectName
+                  progress = $_.progress
+                  startTime = $_.startTime
+              }
+            }
+        $failedEventsTable | Export-Excel -Path ".\Rubrik_failed_backup_events_$todaysDate.xlsx" -AutoSize
+        #  HTML Tables for Mail Body
+        $htmlClusterTable = "<table border='1' style='text-align:center;'>
+        <tr>
+        <th>Cluster Name</th>
+        <th>Health Status</th>
+        <th>Total Storage (TB)</th>
+        <th>Used Storage (TB)</th>
+        <th>Free Storage (TB)</th>
+        <th>Available Storage (%)</th>
+        <th>Total Nodes</th>
+        <th>Healthy Nodes</th>
+        </tr>"
+        foreach ($report in $FinalClusterReports) {
+            $htmlClusterTable += "<tr>
+            <td>$($report.ClusterName)</td>
+            <td>$($report.HealthStatus)</td>
+            <td>$($report.TotalStorageTB)</td>
+            <td>$($report.UsedStorageTB)</td>
+            <td>$($report.FreeStorageTB)</td>
+            <td>$($report.AvailableStorage)</td>
+            <td>$($report.TotalNodes)</td>
+            <td>$($report.HealthyNodes)</td>
+            </tr>"
+        }
+        $htmlClusterTable += "</table>"
+        $vcenterhtmlTable = "<table border='1' style='text-align:center;'>
+        <tr>
+        <th>Cluster Name</th>
+        <th>V-center Name</th>
+        <th>Status</th>
+        </tr>"
+        foreach ($item in $FinalvcenterObjects) {
+            $vcenterhtmlTable += "<tr>
+            <td>$($item.'Cluster Name')</td>
+            <td>$($item.'V-center Name')</td>
+            <td>$($item.Status)</td>
+            </tr>"
+        }
+        $vcenterhtmlTable += "</table>"
+        $htmlTable = "<table border='1' style='text-align:center;'>
+        <tr>
+        <th>Cluster Name</th>
+        <th>Success Backups</th>
+        <th>Failed Backups</th>
+        <th>Backup Success Percentage</th>
+        </tr>"
+        foreach ($result in $Finalqop_results) {
+            $htmlTable += "<tr>
+            <td>$($result.ClusterName)</td>
+            <td>$($result.SuccessBackups)</td>
+            <td>$($result.FailedBackups)</td>
+            <td>$($result.BackupSuccessPercentage)%</td>
+            </tr>"
+        }
+        $htmlTable += "</table>"
+        $sapHanaTable = "<table border='1' style='text-align:center;'>"
+        $sapHanaTable += "<tr>"
+        foreach ($key in $saphanaSummary.PSObject.Properties.Name) {
+            $sapHanaTable += "<th style='width:100px;'>$key</th>"
+        }
+        $sapHanaTable += "</tr>"
+        $sapHanaTable += "<tr>"
+        foreach ($key in $saphanaSummary.PSObject.Properties.Name) {
+            $sapHanaTable += "<td style='width:100px;'>$($saphanaSummary.$key)</td>"
+        }
+        $sapHanaTable += "</tr>"
+        $sapHanaTable += "</table>"
+        $oracleMidIndex = [math]::Ceiling($dataGuardGroups.Count / 2)
+        $oracleFirstHalf = $dataGuardGroups[0..($oracleMidIndex - 1)]
+        $oracleSecondHalf = $dataGuardGroups[$oracleMidIndex..($dataGuardGroups.Count - 1)]
+        function ConvertTo-HTMLTable {
+            param (
+                [array]$data
+            )
+            $htmlTable = "<table border='1' style='text-align:center;'>
+            <tr>"
+            foreach ($item in $data) {
+                $htmlTable += "<th style='width:100px;'>$($item.DataGroup)</th>"
+            }
+            $htmlTable += "</tr><tr>"
+            foreach ($item in $data) {
+                $htmlTable += "<td style='width:100px;'>$($item.Count)</td>"
+            }
+            $htmlTable += "</tr></table>"
+            return $htmlTable
+        }
+        $oracleTable1 = ConvertTo-HTMLTable -data $oracleFirstHalf
+        $oracleTable2 = ConvertTo-HTMLTable -data $oracleSecondHalf
+        $azureHtmlTable ="<table border='1' style='text-align:center;'>
+        <tr>
+        <th>HOSTNAME</th>
+        <th>Status</th>
+        <th>JobFailureCode</th>
+        </tr>"
+        foreach ($result in $azureresults) {
+            $azureHtmlTable += "<tr>"
+            $azureHtmlTable += "<td>$($result.BackupItemUniqueId)</td>"
+            $azureHtmlTable += "<td>$($result.JobStatus)</td>"
+            $azureHtmlTable += "<td>$($result.JobFailureCode)</td>"
+            $azureHtmlTable += "</tr>"
+        }
+        $azureHtmlTable += "</table>"
+        $smtpServer = "smtp..net"
+        $from = "CFSE-DigitalXC-L2@.com"
+        $to = "{{to_email}}"
+        $subject = "Daily Backup Report: $todaysDate"
+        $attachmentPath = ".\Rubrik_failed_backup_events_$todaysDate.xlsx"
+        $body = @"
+        <html>
+        <body>
+        <p>Greetings,</p>
+        <p>Please find below the Daily Backup Report for $todaysDate, </p>
+        <h4>Cluster Health Status in Rubrik:</h4>
+        $htmlClusterTable
+        <br>
+        <h4>Backup Summary ($todaysDate):</h4>
+        $htmlTable
+        <br>
+        <h4>Azure Failed Backups: ($todaysDate):</h4>
+        $azureHtmlTable
+        <br>
+        <h4>V-Center Status:</h4>
+        $vcenterhtmlTable
+        <br>
+        <h4>DataGuard Group Status:</h4>
+        $oracleTable1
+        $oracleTable2
+        <br>
+        <h4>SAP HANA DB Status:</h4>
+        $sapHanaTable
+        <br>
+        <br>
+        Thank you!
+        </body>
+        </html>
+        "@
+        if ( $null -ne $failedEvents -and $failedEvents) {
+        Send-MailMessage -Port 25 -SmtpServer $smtpServer -From $from -To $to -Subject $subject -Body $body -BodyAsHtml -Attachments $attachmentPath
+        } else {
+        Send-MailMessage -Port 25 -SmtpServer $smtpServer -From $from -To $to -Subject $subject -Body $body -BodyAsHtml
+        }
+      register: result
+      ignore_errors: true
